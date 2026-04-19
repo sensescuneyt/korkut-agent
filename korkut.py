@@ -14,7 +14,7 @@ Core capabilities:
 Setup:
   1. Install dependencies: pip install -r requirements.txt
   2. Start local model server:
-       mlx_lm.server --model <model-name> --port 8080
+       mlx_lm.server --model <model-name> --port 8005
   3. Run: python korkut.py
 """
 
@@ -260,14 +260,17 @@ def print_timing_summary():
 # ══════════════════════════════════════════════════════════════
 
 def clean_json(raw):
+    # Remove complete <think>...</think> blocks
     raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL)
+    # Remove unclosed <think> block (model hit max_tokens mid-think)
     raw = re.sub(r"<think>.*", "", raw, flags=re.DOTALL)
     raw = raw.strip()
     if raw.startswith("```"):
         raw = raw.split("```")[1]
         if raw.startswith("json"):
             raw = raw[4:]
-    match = __import__("re").search(r"\{.*\}", raw, flags=__import__("re").DOTALL)
+    # Extract first JSON object if there's surrounding text
+    match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
     if match:
         raw = match.group(0)
     return raw.strip()
@@ -542,6 +545,7 @@ def loop_call(history, state=None):
                     messages=messages,
                     tools=TOOL_DECLARATIONS,
                     temperature=0,
+                    max_tokens=1024,
                 )
                 msg     = resp.choices[0].message
                 content = re.sub(r"<think>.*?</think>", "", msg.content or "", flags=re.DOTALL).strip()
@@ -608,10 +612,27 @@ def answer_call(goal, history, tools_used):
             model=MLX_MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=0,
+            max_tokens=2048,
+            extra_body={"thinking": {"type": "disabled"}},
         )
         return {"message": {"content": resp.choices[0].message.content}}
     response = timed_call(label="answer_call", model=MLX_MODEL, fn=_call)
-    return AgentAnswer.model_validate_json(clean_json(response["message"]["content"]))
+    raw = response["message"]["content"]
+    cleaned = clean_json(raw)
+    if not cleaned:
+        # Extract last tool result from history as fallback answer
+        last_obs = ""
+        for entry in reversed(history):
+            if entry.get("role") == "tool":
+                last_obs = entry.get("content", "")
+                break
+        return AgentAnswer(
+            answer=last_obs or "Task completed. See conversation history for details.",
+            tools_used=tools_used,
+            confidence=0.7,
+            reason="Answer extracted from tool results (model response was empty).",
+        )
+    return AgentAnswer.model_validate_json(cleaned)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -765,7 +786,496 @@ def run_agent(goal, max_steps=None, state=None):
         reason="Step limit reached with no observations."
     ), []
 
--e 
 
-if __name__ == '__main__':
-    print('Korkut agent — devam ediyor...')
+# ══════════════════════════════════════════════════════════════
+# PLANNING
+# ══════════════════════════════════════════════════════════════
+
+def make_plan(goal):
+    prompt = (
+        "/no_think\n"
+        f"Analyze this goal and create an execution plan.\n"
+        f"Goal: {goal}\n\n"
+        f"Available tools:\n"
+        f"- get_coordinates(city) → lat/lon for a city\n"
+        f"- get_weather(lat, lon) → current weather\n"
+        f"- search_web(query) → search the internet\n"
+        f"- execute_code(code) → run Python code\n\n"
+        f"Rules for subtasks:\n"
+        f"- ONLY plan what the user explicitly asked for — do NOT add extra steps\n"
+        f"- 'coordinate of istanbul' → 1 sub-task\n"
+        f"- get_coordinates + get_weather are always chained — treat as ONE sub-task\n"
+        f"- Sub-task names MUST be plain English — NEVER write function calls or code\n"
+        f"- Maximum 5 sub-tasks\n\n"
+        f"Rules for is_ambiguous:\n"
+        f"- TRUE when same words lead to completely different actions\n\n"
+        f"Rules for is_complex:\n"
+        f"- TRUE if 2 or more sub-tasks are needed\n"
+        f"- FALSE only for a single direct lookup (1 sub-task, no analysis)\n\n"
+        f"Set needs_replan to false.\n\n"
+        f"Respond ONLY with this exact JSON, no markdown:\n"
+        f'{{"subtasks": ["subtask 1"], "needs_replan": false, "is_ambiguous": false, "question": "", "is_complex": false}}'
+    )
+    def _call():
+        resp = mlx.chat.completions.create(
+            model=MLX_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+            max_tokens=2048,
+            extra_body={"thinking": {"type": "disabled"}},
+        )
+        return {"message": {"content": resp.choices[0].message.content}}
+    response = timed_call(label="make_plan", model=MLX_MODEL, fn=_call)
+    raw = response["message"]["content"]
+    cleaned = clean_json(raw)
+    if not cleaned:
+        cleaned = f'{{"subtasks": ["{goal[:80]}"], "needs_replan": false, "is_ambiguous": false, "question": "", "is_complex": false}}'
+    return Plan.model_validate_json(cleaned)
+
+
+def should_replan(remaining_plan, last_result):
+    if not remaining_plan:
+        return remaining_plan
+    try:
+        prompt = (
+            "/no_think\n"
+            f"Sub-task result:\n{last_result[:500]}\n\n"
+            f"Remaining plan:\n"
+            f"{chr(10).join(f'{i+1}. {t}' for i, t in enumerate(remaining_plan))}\n\n"
+            f"Does this result change any remaining steps?\n"
+            f"If NO: return plan unchanged, needs_replan=false.\n"
+            f"If YES: return updated subtasks, needs_replan=true.\n\n"
+            f"Respond ONLY with this exact JSON, no markdown:\n"
+            f'{{"subtasks": {json.dumps(remaining_plan)}, "needs_replan": false, "is_ambiguous": false, "question": "", "is_complex": true}}'
+        )
+        def _call():
+            resp = mlx.chat.completions.create(
+                model=MLX_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0,
+                    max_tokens=512,
+                    extra_body={"thinking": {"type": "disabled"}},
+            )
+            return {"message": {"content": resp.choices[0].message.content}}
+        response = timed_call(label="should_replan", model=MLX_MODEL, fn=_call)
+        result = Plan.model_validate_json(clean_json(response["message"]["content"]))
+        if result.needs_replan:
+            print(f"  📝 Plan updated.")
+        return result.subtasks if result.subtasks else remaining_plan
+    except Exception as e:
+        print(f"  ⚠️ Re-plan failed ({e}), continuing with existing plan.")
+        return remaining_plan
+
+
+# ══════════════════════════════════════════════════════════════
+# REFLECTION
+# ══════════════════════════════════════════════════════════════
+
+def critique(answer, goal, grounding):
+    prompt = (
+        f"/no_think\n"
+        f"You are a strict reviewer. Review this answer to: {goal}\n\n"
+        f"Raw data retrieved by tools:\n{grounding}\n\n"
+        f"Answer to review:\n{answer}\n\n"
+        f"Score 1–10. Only evaluate based on the raw data above.\n"
+        f"If the answer is missing data that COULD be retrieved with a tool, "
+        f"list specific sub-tasks in new_subtasks.\n"
+        f"If nothing is missing, leave new_subtasks as an empty list.\n\n"
+        f"Respond ONLY with this exact JSON, no markdown:\n"
+        f'{{"score": 7.0, "approved": false, "missing": "...", "wrong": "...", "improvements": "...", "new_subtasks": []}}\n\n'
+        f"If score >= {REFLECTION_THRESHOLD}: approved=true. Otherwise approved=false."
+    )
+    def _call():
+        resp = mlx.chat.completions.create(
+            model=MLX_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+                    max_tokens=512,
+                    extra_body={"thinking": {"type": "disabled"}},
+        )
+        return {"message": {"content": resp.choices[0].message.content}}
+    response = timed_call(label="critique", model=MLX_MODEL, fn=_call)
+    c = Critique.model_validate_json(clean_json(response["message"]["content"]))
+    c.approved = c.score >= REFLECTION_THRESHOLD
+    return c
+
+
+def refine(answer, review, goal):
+    prompt = (
+        f"/no_think\n"
+        f"The user asked: {goal}\n\n"
+        f"Original answer:\n{answer}\n\n"
+        f"Critique:\n"
+        f"- Score: {review.score}/10\n"
+        f"- Missing: {review.missing}\n"
+        f"- Wrong: {review.wrong}\n"
+        f"- Improvements: {review.improvements}\n\n"
+        f"Rewrite fixing ALL issues. Keep what was good.\n\n"
+        f"Respond ONLY with this exact JSON, no markdown:\n"
+        f'{{"answer": "...", "tools_used": [], "confidence": 0.95, "reason": "..."}}'
+    )
+    def _call():
+        resp = mlx.chat.completions.create(
+            model=MLX_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+                    max_tokens=512,
+                    extra_body={"thinking": {"type": "disabled"}},
+        )
+        return {"message": {"content": resp.choices[0].message.content}}
+    response = timed_call(label="refine", model=MLX_MODEL, fn=_call)
+    return AgentAnswer.model_validate_json(clean_json(response["message"]["content"]))
+
+
+def synthesize(goal, subtask_results, raw_observations, is_complex, tools_used=None):
+    # Fix 3a: cap each sub-task answer at 400 chars so large topics
+    # don't overflow the LLM context and cause truncated JSON
+    MAX_ANSWER_CHARS = 400
+    combined  = "\n\n".join(
+        f"Sub-task: {r['subtask']}\nResult: {r['answer'][:MAX_ANSWER_CHARS]}"
+        + ("..." if len(r['answer']) > MAX_ANSWER_CHARS else "")
+        for r in subtask_results
+    )
+    grounding = "\n".join(f"- {o}" for o in raw_observations) if raw_observations else "No raw observations."
+
+    prompt = (
+        f"/no_think\n"
+        f"The user asked: {goal}\n\n"
+        f"Research findings:\n{combined}\n\n"
+        f"Confidence rules:\n"
+        f"- 0.9–1.0: all findings directly answer the question\n"
+        f"- 0.6–0.8: relevant but incomplete or uncertain\n"
+        f"- 0.0–0.5: vague, speculative, or future predictions\n\n"
+        f"tools_used MUST be exactly: {json.dumps(tools_used or [])}\n"
+        f"Respond ONLY with this exact JSON, no markdown:\n"
+        f"Do NOT change tools_used — use the exact list provided above.\n"
+        f'{{"answer": "...", "tools_used": {json.dumps(tools_used or [])}, "confidence": 0.95, "reason": "..."}}'
+    )
+    def _call():
+        resp = mlx.chat.completions.create(
+            model=MLX_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+                    max_tokens=512,
+                    extra_body={"thinking": {"type": "disabled"}},
+        )
+        return {"message": {"content": resp.choices[0].message.content}}
+    response = timed_call(label="synthesize", model=MLX_MODEL, fn=_call)
+    # Fix 3b: if LLM response was truncated, extract partial answer
+    # instead of crashing with EOF JSON parse error
+    raw = clean_json(response["message"]["content"])
+    try:
+        result = AgentAnswer.model_validate_json(raw)
+    except Exception as parse_err:
+        print(f"  ⚠️  Synthesize JSON truncated ({parse_err}), extracting partial answer...")
+        # Pull out whatever answer text exists before the truncation
+        partial = re.search(r'"answer"\s*:\s*"(.*)', raw, re.DOTALL)
+        partial_text = partial.group(1)[:800] if partial else "Synthesis truncated — see sub-task results."
+        result = AgentAnswer(
+            answer=partial_text,
+            tools_used=tools_used or [],
+            confidence=0.6,
+            reason="Synthesis response was truncated — partial answer extracted."
+        )
+    result.tools_used = tools_used or result.tools_used
+
+    if not is_complex:
+        return result
+
+    print(f"\n🔍 Reflecting on answer...")
+    for round_num in range(MAX_REVISIONS):
+        try:
+            review = critique(result.answer, goal, grounding)
+            print(f"  📝 Round {round_num+1}/{MAX_REVISIONS}: score {review.score:.1f}/10 — ", end="")
+
+            if review.approved:
+                print("✅ Approved")
+                break
+
+            if review.new_subtasks and round_num < MAX_REPLAN_ROUNDS:
+                print(f"🔄 Missing data — executing {len(review.new_subtasks)} new sub-task(s)...")
+                for new_task in review.new_subtasks:
+                    print(f"\n▶ New sub-task: {new_task}")
+                    new_result, new_obs = run_agent(new_task, max_steps=MAX_STEPS_SIMPLE)
+                    if new_result:
+                        subtask_results.append({"subtask": new_task, "answer": new_result.answer})
+                        raw_observations.extend(new_obs)
+                        grounding = "\n".join(f"- {o}" for o in raw_observations)
+
+                combined = "\n\n".join(
+                    f"Sub-task: {r['subtask']}\nResult: {r['answer']}"
+                    for r in subtask_results
+                )
+                revised_prompt = (
+                    f"/no_think\n"
+                    f"The user asked: {goal}\n\n"
+                    f"Research findings:\n{combined}\n\n"
+                    f"Respond ONLY with this exact JSON, no markdown:\n"
+                    f'{{"answer": "...", "tools_used": {json.dumps(tools_used or [])}, "confidence": 0.95, "reason": "..."}}'
+                )
+                def _revised_call(p=revised_prompt):
+                    resp = mlx.chat.completions.create(
+                        model=MLX_MODEL,
+                        messages=[{"role": "user", "content": p}],
+                        temperature=0,
+                    max_tokens=512,
+                    extra_body={"thinking": {"type": "disabled"}},
+                    )
+                    return {"message": {"content": resp.choices[0].message.content}}
+                response2 = timed_call(label="synthesize (revised)", model=MLX_MODEL, fn=_revised_call)
+                result = AgentAnswer.model_validate_json(clean_json(response2["message"]["content"]))
+                result.tools_used = tools_used or result.tools_used  # always restore real tools
+            else:
+                print(f"revising... ({review.improvements[:60]}...)")
+                result = refine(result.answer, review, goal)
+                result.tools_used = tools_used or result.tools_used  # always restore real tools
+
+        except Exception as e:
+            print(f"  ⚠️ Reflection failed ({e}), using current answer.")
+            break
+
+    return result
+
+
+# ══════════════════════════════════════════════════════════════
+# Automatically saves a structured markdown report to AGENT_FILES_DIR
+# after synthesis for any complex multi-step research task.
+# Triggers request_approval first, then write_file.
+# No need to say "write a report" in the prompt — it just happens.
+# ══════════════════════════════════════════════════════════════
+
+def auto_save_report(goal: str, final: "AgentAnswer", state: "AgentState") -> str | None:
+    """
+    Build a structured markdown report from the final answer + state,
+    ask for human approval, then write it to AGENT_FILES_DIR.
+    Returns the file path string on success, None if skipped/rejected.
+    """
+    # Generate a clean filename from the goal
+    slug = re.sub(r"[^a-z0-9]+", "_", goal.lower())[:50].strip("_")
+    filename = f"{slug}_report.md"
+
+    # Build the markdown report
+    sections = []
+    sections.append(f"# Research Report\n")
+    sections.append(f"**Goal:** {goal}\n")
+    sections.append(f"**Status:** {state.status}  ")
+    sections.append(f"**Tokens used:** {state.token_count}  ")
+    sections.append(f"**Sub-tasks completed:** {state.current_step}/{len(state.plan)}\n")
+    sections.append(f"---\n")
+    sections.append(f"## Findings\n")
+    sections.append(final.answer)
+    sections.append(f"\n---\n")
+    sections.append(f"## Sub-task Breakdown\n")
+    for i, r in enumerate(state.subtask_results, 1):
+        sections.append(f"### {i}. {r['subtask']}\n{r['answer'][:400]}...\n")
+    if state.errors:
+        sections.append(f"\n## Errors\n")
+        for e in state.errors:
+            sections.append(f"- Step {e['step']} | {e['tool']}: {e['reason']}\n")
+    sections.append(f"\n---\n")
+    sections.append(f"*Confidence: {final.confidence:.2f} — {final.reason}*\n")
+    sections.append(f"*Tools used: {', '.join(final.tools_used)}*\n")
+
+    report_content = "\n".join(sections)
+
+    # Always ask for approval before writing
+    approval = request_approval(
+        action=f"Write research report to {AGENT_FILES_DIR / filename}",
+        reason=f"Saving structured report ({len(report_content.splitlines())} lines) for: {goal[:60]}"
+    )
+    if "approved" not in approval.lower():
+        print(f"  ℹ️  Report write skipped.")
+        return None
+
+    result = write_file(filename, report_content)
+    print(f"  📄 {result}")
+    return str(AGENT_FILES_DIR / filename)
+
+
+# ══════════════════════════════════════════════════════════════
+# PLAN AND EXECUTE
+# ══════════════════════════════════════════════════════════════
+
+def plan_and_execute(goal):
+    print(f"\nGoal: {goal}")
+    print("─" * 40)
+
+    # check for existing checkpoint before starting fresh
+    state = load_checkpoint(goal)
+
+    if state is None:
+        # Fresh run
+        state = AgentState(goal=goal)
+
+        print("\n📋 Planning...")
+        plan = make_plan(goal)
+
+        # ambiguity check
+        if plan.is_ambiguous:
+            print(f"\n🟢 Clarification needed: {plan.question}")
+            clarification = input("   Your answer: ").strip()
+            if clarification:
+                goal = f"{goal} ({clarification})"
+                print(f"   Updated goal: {goal}")
+                plan = make_plan(goal)
+
+        subtasks   = plan.subtasks
+        step_limit = MAX_STEPS_COMPLEX if plan.is_complex else MAX_STEPS_SIMPLE
+        state.plan       = subtasks
+        state.max_steps  = step_limit * len(subtasks)
+        is_complex       = plan.is_complex
+
+        print(f"Plan ({len(subtasks)} sub-task(s), {step_limit} steps each, "
+              f"complex={plan.is_complex}):")
+        for i, task in enumerate(subtasks, 1):
+            print(f"  {i}. {task}")
+
+        # Routing — simple single-step tasks
+        if len(subtasks) == 1 and not plan.is_complex:
+            print("  → Simple task: direct execution (no reflection)")
+            result, _ = run_agent(goal, max_steps=step_limit, state=state)
+            if result:
+                state.status = "done"
+                update_knowledge(state, "answer", result.answer)
+            return result
+
+        subtask_results  = []
+        all_observations = []
+        remaining        = subtasks.copy()
+        is_complex       = plan.is_complex
+
+    else:
+        # Resuming from checkpoint
+        subtasks         = state.plan
+        step_limit       = MAX_STEPS_COMPLEX if state.is_complex else MAX_STEPS_SIMPLE
+        is_complex       = state.is_complex  # use persisted value, not a guess
+
+        # instead of reconstructing from knowledge keys (fragile)
+        subtask_results  = list(state.subtask_results)
+        all_observations = [
+            f"{k}: {v}" for k, v in state.knowledge.items()
+            if k not in ("answer", "final_answer") and v != "UNAVAILABLE"
+        ]
+
+        # Skip completed sub-tasks
+        remaining = subtasks[state.current_step:]
+        print(f"  Resuming from sub-task {state.current_step + 1}/{len(subtasks)}: {remaining[0] if remaining else '(all done)'}")
+
+    # ── SESSION 10: track failed sub-tasks for partial results ──
+    failed_subtasks = []
+    total = len(subtasks)
+
+    while remaining:
+        subtask    = remaining.pop(0)
+        done_count = total - len(remaining)
+
+        # checkpoint before each sub-task
+        ckpt_path = checkpoint_state(state)
+        print(f"  💾 Checkpoint saved → {ckpt_path}")
+
+        is_last = len(remaining) == 0
+        if subtask_results and is_last:
+            context = "\n".join(
+                f"- {r['subtask']}: {r['answer'][:120]}..."
+                for r in subtask_results
+            )
+            subtask_with_context = (
+                f"{subtask}\n\nPrevious findings (for reference only — still use tools):\n{context}"
+            )
+        else:
+            subtask_with_context = subtask
+
+        print(f"\n⬜ Progress: {done_count}/{total} — {subtask}")
+
+        # wrap sub-task execution — catch failures gracefully
+        try:
+            result, obs = run_agent(subtask_with_context, max_steps=step_limit, state=state)
+            all_observations.extend(obs)
+
+            if result:
+                entry = {
+                    "subtask": subtask,
+                    "answer":  result.answer,
+                    "tools":   result.tools_used,
+                }
+                subtask_results.append(entry)
+                knowledge_key = re.sub(r"[^a-z0-9_]", "_", subtask.lower())[:40]
+                update_knowledge(state, knowledge_key, result.answer[:300])
+                if remaining:
+                    print("\n🔄 Checking if plan needs updating...")
+                    remaining = should_replan(remaining, result.answer)
+                    if remaining:
+                        print(f"  Remaining steps: {len(remaining)}")
+
+        except Exception as e:
+            # Level 2–3: Skip & Note — sub-task failed, continue with rest
+            print(f"\n⛔ Sub-task failed: {subtask[:60]} — {e}")
+            failed_subtasks.append({"subtask": subtask, "reason": str(e)[:120]})
+            record_error(state, state.steps_taken, "sub-task", f"{subtask[:60]}: {str(e)[:80]}")
+            knowledge_key = re.sub(r"[^a-z0-9_]", "_", subtask.lower())[:40]
+            update_knowledge(state, knowledge_key, "UNAVAILABLE")
+            # Continue with remaining sub-tasks (partial results > nothing)
+
+    print("\n🔗 Synthesizing all results...")
+    all_tools = list(dict.fromkeys(t for r in subtask_results for t in r.get("tools", [])))
+
+    if subtask_results:
+        final = synthesize(goal, subtask_results, all_observations, is_complex, tools_used=all_tools)
+    else:
+        # Everything failed — graceful exit
+        final = AgentAnswer(
+            answer="All sub-tasks failed. No results available.",
+            tools_used=[],
+            confidence=0.0,
+            reason="All sub-tasks failed after retries.",
+        )
+
+    # set final status
+    if failed_subtasks:
+        state.status = "completed_with_errors"
+        update_knowledge(state, "final_answer", final.answer[:300])
+    else:
+        state.status = "done"
+        update_knowledge(state, "final_answer", final.answer[:300])
+
+    # partial results report
+    print(f"\n📊 State Summary:")
+    print(state_summary(state))
+
+    if is_complex and subtask_results:
+        print(f"\n📝 Saving research report...")
+        auto_save_report(goal, final, state)
+
+    if failed_subtasks:
+        print(f"\n⚠️  Partial results — {len(failed_subtasks)} sub-task(s) failed:")
+        for f in failed_subtasks:
+            print(f"   ❌ {f['subtask'][:60]} — {f['reason'][:80]}")
+        print(f"   ✅ {len(subtask_results)}/{total} sections completed successfully.")
+
+    # Clean up checkpoint on completion
+    ckpt_path = checkpoint_state(state)
+    if state.status in ("done", "completed_with_errors"):
+        ckpt_path.unlink(missing_ok=True)
+
+    return final
+
+
+# ══════════════════════════════════════════════════════════════
+# RUN
+# ══════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    while True:
+        goal = input("\nYou: ").strip()
+        if goal.lower() == "quit":
+            break
+        t_total = time.perf_counter()
+        result  = plan_and_execute(goal)
+        elapsed = time.perf_counter() - t_total
+        if result:
+            print(f"\nAnswer:     {result.answer}")
+            print(f"Tools used: {result.tools_used}")
+            print(f"Confidence: {result.confidence:.2f}")
+            print(f"Status note: {result.reason}")
+            print(f"Total time: {elapsed:.1f}s")
+            print_timing_summary()
